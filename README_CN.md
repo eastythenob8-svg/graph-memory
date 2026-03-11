@@ -50,10 +50,6 @@
 
 **压缩 75%。** 红色 = 无 graph-memory（线性增长）。蓝色 = 有 graph-memory（图谱替代后收敛）。
 
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="Session tokens" width="60%" />
-</p>
-
 ## 工作原理
 
 ### 知识图谱
@@ -107,46 +103,67 @@ session_end
 
 ### 前置条件
 
-- [OpenClaw](https://github.com/anthropics/openclaw)（支持插件上下文引擎）
+- [OpenClaw](https://github.com/openclaw/openclaw)（v2026.3.x+）
 - Node.js 22+
-- 已在 OpenClaw 中配置 LLM provider
 
-### 从 GitHub 安装
+### 第一步：安装插件
 
 ```bash
-openclaw plugins install github:adoresever/graph-memory
+pnpm openclaw plugins install graph-memory
 ```
 
-本地 OpenClaw 源码部署：
+就这一条命令。不需要 `node-gyp`，不需要手动编译。SQLite 驱动（`@photostructure/sqlite`）将预编译二进制打包在 npm tarball 内，完全兼容 OpenClaw 的 `--ignore-scripts` 安装机制。
+
+也可以从 GitHub 安装：
 
 ```bash
 pnpm openclaw plugins install github:adoresever/graph-memory
 ```
 
-### 本地开发
+### 第二步：激活上下文引擎（关键！）
 
-```bash
-openclaw plugins install --link /path/to/graph-memory
-```
+这是**最容易遗漏的一步**。graph-memory 必须被注册为上下文引擎，否则 OpenClaw 只会用它做召回，**不会触发消息入库和知识提取**。
 
-### 配置
-
-安装后，在 `~/.openclaw/openclaw.json` 中添加 LLM 和 Embedding 密钥：
+编辑 `~/.openclaw/openclaw.json`，在 `plugins` 中添加 `slots`：
 
 ```json
 {
   "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
+    "entries": {
+      "graph-memory": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+如果没有 `plugins.slots.contextEngine`，插件虽然注册成功，但 `ingest` / `assemble` / `compact` 管线不会启动——你会在日志里看到 `recall`，但数据库里没有任何数据。
+
+### 第三步：配置 LLM 和 Embedding
+
+在 `plugins.entries.graph-memory.config` 中添加 API 密钥：
+
+```json
+{
+  "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
     "entries": {
       "graph-memory": {
         "enabled": true,
         "config": {
           "llm": {
-            "apiKey": "你的API密钥",
+            "apiKey": "你的LLM-API密钥",
             "baseURL": "https://api.openai.com/v1",
             "model": "gpt-4o-mini"
           },
           "embedding": {
-            "apiKey": "你的API密钥",
+            "apiKey": "你的Embedding-API密钥",
             "baseURL": "https://api.openai.com/v1",
             "model": "text-embedding-3-small",
             "dimensions": 512
@@ -158,22 +175,111 @@ openclaw plugins install --link /path/to/graph-memory
 }
 ```
 
-- **llm**: 必填。用于知识提取，建议用便宜/快速的模型。
-- **embedding**: 可选。启用语义搜索和向量去重。不配则降级为 FTS5 全文搜索。
-- 其他所有参数都有合理的默认值，无需设置。
+**LLM**（`config.llm`）— 必填。用于 `compact` 阶段的知识提取。支持任何 OpenAI 兼容端点。建议用便宜/快速的模型。
 
-配置完成后重启 OpenClaw。
+**Embedding**（`config.embedding`）— 可选。启用语义向量搜索 + 向量去重。不配则降级为 FTS5 全文搜索（仍然可用，只是基于关键词匹配）。
 
-### 验证
+如果不配 `config.llm`，graph-memory 会回退到环境变量 `ANTHROPIC_API_KEY` + Anthropic API。
+
+### 完整 openclaw.json 示例
+
+以下是一个使用自定义 OpenAI 兼容 provider 的完整配置：
+
+```json
+{
+  "models": {
+    "providers": {
+      "my-provider": {
+        "baseUrl": "https://api.example.com/v1",
+        "apiKey": "你的主模型API密钥",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "my-model",
+            "name": "My Model",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "my-provider/my-model"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
+    "entries": {
+      "graph-memory": {
+        "enabled": true,
+        "config": {
+          "llm": {
+            "apiKey": "你的LLM密钥",
+            "baseURL": "https://api.example.com/v1",
+            "model": "my-model"
+          },
+          "embedding": {
+            "apiKey": "你的Embedding密钥",
+            "baseURL": "https://api.embedding-provider.com/v1",
+            "model": "text-embedding-model",
+            "dimensions": 1024
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+> **注意**：`config.llm.baseURL` 是大写 `URL`（OpenAI SDK 格式），而 OpenClaw provider 的 `baseUrl` 是小写 `l`。不要搞混。
+
+### 重启并验证
+
+```bash
+pnpm openclaw gateway --verbose
+```
+
+启动日志中应该看到这两行：
 
 ```
 [graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
 [graph-memory] vector search ready
 ```
 
+如果看到 `FTS5 search mode` 而不是 `vector search ready`，说明 embedding 配置缺失或 API Key 无效。
+
+对话几轮后验证知识提取：
+
 ```bash
+# 检查消息是否入库
+sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
+
+# 检查知识三元组是否提取成功
 sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
+
+# 在 gateway 日志中检查跨对话召回
+# 看是否有: [graph-memory] recalled N nodes, M edges
 ```
+
+### 常见问题
+
+| 现象 | 原因 | 解决 |
+|------|------|------|
+| `recall` 正常但 `gm_messages` 为空 | 没设置 `plugins.slots.contextEngine` | 在 `plugins.slots` 中添加 `"contextEngine": "graph-memory"` |
+| 显示 `FTS5 search mode` | Embedding 未配置或 API Key 无效 | 检查 `config.embedding` 的密钥和地址 |
+| 启动报 `Database is not defined` | 安装了旧版本 | 升级到 v1.1.1+：`pnpm openclaw plugins install graph-memory` |
+| 对话很多轮但节点为空 | 消息数未达到 `compactTurnCount` | 默认需要 7 条消息。继续对话或调低该值 |
 
 ## Agent 工具
 
@@ -212,6 +318,8 @@ sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_node
 ## 开发
 
 ```bash
+git clone https://github.com/adoresever/graph-memory.git
+cd graph-memory
 npm install
 npm test        # 53 个测试
 npx vitest      # 监听模式

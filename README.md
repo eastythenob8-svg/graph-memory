@@ -48,10 +48,6 @@ When conversations grow long, agents lose track of what happened. graph-memory s
 
 **75% compression.** Red = linear growth without graph-memory. Blue = stabilized with graph-memory.
 
-<p align="center">
-  <img src="docs/images/token-sessions.png" alt="Session tokens" width="60%" />
-</p>
-
 ## How it works
 
 ### The Knowledge Graph
@@ -105,46 +101,67 @@ Unlike global PageRank, PPR ranks nodes **relative to your current query**:
 
 ### Prerequisites
 
-- [OpenClaw](https://github.com/anthropics/openclaw) with plugin context engine support
+- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.3.x+)
 - Node.js 22+
-- An LLM provider configured in OpenClaw
 
-### Install from GitHub
+### Step 1: Install the plugin
 
 ```bash
-openclaw plugins install github:adoresever/graph-memory
+pnpm openclaw plugins install graph-memory
 ```
 
-From a local OpenClaw checkout:
+That's it. No `node-gyp`, no manual compilation. The SQLite driver (`@photostructure/sqlite`) ships prebuilt binaries inside the npm tarball — works with OpenClaw's `--ignore-scripts` install.
+
+You can also install from GitHub:
 
 ```bash
 pnpm openclaw plugins install github:adoresever/graph-memory
 ```
 
-### Local development
+### Step 2: Activate context engine
 
-```bash
-openclaw plugins install --link /path/to/graph-memory
-```
+This is the **critical step** most people miss. graph-memory must be registered as the context engine, otherwise OpenClaw will only use it for recall but **won't ingest messages or extract knowledge**.
 
-### Configure
-
-After installation, add LLM and embedding credentials to `~/.openclaw/openclaw.json`:
+Edit `~/.openclaw/openclaw.json` and add `plugins.slots`:
 
 ```json
 {
   "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
+    "entries": {
+      "graph-memory": {
+        "enabled": true
+      }
+    }
+  }
+}
+```
+
+Without `"contextEngine": "graph-memory"` in `plugins.slots`, the plugin registers but the `ingest` / `assemble` / `compact` pipeline never fires — you'll see `recall` in logs but zero data in the database.
+
+### Step 3: Configure LLM and Embedding
+
+Add your API credentials inside `plugins.entries.graph-memory.config`:
+
+```json
+{
+  "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
     "entries": {
       "graph-memory": {
         "enabled": true,
         "config": {
           "llm": {
-            "apiKey": "your-api-key",
+            "apiKey": "your-llm-api-key",
             "baseURL": "https://api.openai.com/v1",
             "model": "gpt-4o-mini"
           },
           "embedding": {
-            "apiKey": "your-api-key",
+            "apiKey": "your-embedding-api-key",
             "baseURL": "https://api.openai.com/v1",
             "model": "text-embedding-3-small",
             "dimensions": 512
@@ -156,22 +173,111 @@ After installation, add LLM and embedding credentials to `~/.openclaw/openclaw.j
 }
 ```
 
-- **llm**: Required. Used for knowledge extraction. Use a cheap/fast model.
-- **embedding**: Optional. Enables semantic search + vector dedup. Without it, falls back to FTS5 full-text search.
-- All other parameters have sensible defaults — no need to set them.
+**LLM** (`config.llm`) — Required. Used for knowledge extraction during `compact`. Any OpenAI-compatible endpoint works. Use a cheap/fast model.
 
-Restart OpenClaw after configuration changes.
+**Embedding** (`config.embedding`) — Optional. Enables semantic vector search + vector dedup. Without it, falls back to FTS5 full-text search (still works, just keyword-based).
 
-### Verify
+If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` environment variable + Anthropic API.
+
+### Full openclaw.json example
+
+Here's a complete working configuration with a custom OpenAI-compatible provider:
+
+```json
+{
+  "models": {
+    "providers": {
+      "my-provider": {
+        "baseUrl": "https://api.example.com/v1",
+        "apiKey": "your-main-api-key",
+        "api": "openai-completions",
+        "models": [
+          {
+            "id": "my-model",
+            "name": "My Model",
+            "reasoning": false,
+            "input": ["text"],
+            "contextWindow": 128000,
+            "maxTokens": 8192
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "my-provider/my-model"
+      },
+      "compaction": {
+        "mode": "safeguard"
+      }
+    }
+  },
+  "plugins": {
+    "slots": {
+      "contextEngine": "graph-memory"
+    },
+    "entries": {
+      "graph-memory": {
+        "enabled": true,
+        "config": {
+          "llm": {
+            "apiKey": "your-llm-api-key",
+            "baseURL": "https://api.example.com/v1",
+            "model": "my-model"
+          },
+          "embedding": {
+            "apiKey": "your-embedding-api-key",
+            "baseURL": "https://api.embedding-provider.com/v1",
+            "model": "text-embedding-model",
+            "dimensions": 1024
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+> **Note**: `config.llm.baseURL` uses uppercase `URL` (OpenAI SDK format). This is different from the OpenClaw provider's `baseUrl` (lowercase `l`). Don't mix them up.
+
+### Restart and verify
+
+```bash
+pnpm openclaw gateway --verbose
+```
+
+You should see these two lines in the startup log:
 
 ```
 [graph-memory] ready | db=~/.openclaw/graph-memory.db | provider=... | model=...
 [graph-memory] vector search ready
 ```
 
+If you see `FTS5 search mode` instead of `vector search ready`, your embedding config is missing or the API key is invalid.
+
+After a few rounds of conversation, verify knowledge extraction:
+
 ```bash
+# Check messages are being ingested
+sqlite3 ~/.openclaw/graph-memory.db "SELECT COUNT(*) FROM gm_messages;"
+
+# Check knowledge triples are being extracted
 sqlite3 ~/.openclaw/graph-memory.db "SELECT type, name, description FROM gm_nodes LIMIT 10;"
+
+# Check cross-session recall is working (in gateway logs)
+# Look for: [graph-memory] recalled N nodes, M edges
 ```
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `recall` works but `gm_messages` is empty | `plugins.slots.contextEngine` not set | Add `"contextEngine": "graph-memory"` to `plugins.slots` |
+| `FTS5 search mode` instead of `vector search ready` | Embedding not configured or API key invalid | Check `config.embedding` credentials |
+| `Database is not defined` error on startup | Old version installed | Update to v1.1.1+: `pnpm openclaw plugins install graph-memory` |
+| Nodes are empty after many messages | `compactTurnCount` not reached | Default is 7 messages. Keep chatting or set a lower value |
 
 ## Agent tools
 
@@ -199,7 +305,7 @@ All parameters have defaults. Only set what you want to override.
 
 ## Database
 
-SQLite via `better-sqlite3`. Default: `~/.openclaw/graph-memory.db`.
+SQLite via `@photostructure/sqlite` (prebuilt binaries, zero native compilation). Default: `~/.openclaw/graph-memory.db`.
 
 | Table | Purpose |
 |-------|---------|
