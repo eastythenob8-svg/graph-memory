@@ -4,24 +4,21 @@
  * By: adoresever
  * Email: Wywelljob@gmail.com
  *
- * v1.0.0：
- *   - 从 kg-memory 改名为 graph-memory
- *   - 个性化 PageRank（PPR）：根据用户当前问题动态排序，不是全局固定排名
- *   - 社区感知召回：同社区节点一起拉出
- *   - 向量余弦去重：语义重复的节点自动合并
- *   - session_end 时自动运行图维护（全局 PR 基线 + 社区检测 + 去重）
+ * v1.1.0：
+ *   - 去掉 signals 机制，每轮直接提取
+ *   - content 模板改为纯文本（无 markdown）
+ *   - 提取规则放宽：讨论、分析、对比也会提取
  */
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { Type } from "@sinclair/typebox";
 import { getDb } from "./src/store/db.ts";
 import {
-  saveMessage, saveSignal, pendingSignals, getUnextracted,
-  markExtracted, markSignalsDone,
+  saveMessage, getUnextracted,
+  markExtracted,
   upsertNode, upsertEdge, findByName,
   getBySession, edgesFrom, edgesTo,
   deprecate, getStats,
 } from "./src/store/store.ts";
-import { detectSignals } from "./src/engine/signals.ts";
 import { createCompleteFn } from "./src/engine/llm.ts";
 import { createEmbedFn } from "./src/engine/embed.ts";
 import { Recaller } from "./src/recaller/recall.ts";
@@ -128,113 +125,83 @@ const graphMemoryPlugin = {
     const msgSeq = new Map<string, number>();
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
 
-    // ── Compact 中断机制：用户对话第一优先级 ────────────────
-    //
-    // 问题：compact 调 LLM 提取知识，跟用户对话抢同一个 API 额度（RPM）
-    // 方案：compact 在后台异步跑（不阻塞 afterTurn），用户发新消息时
-    //       设置 abort 标志，正在跑的 compact 每个 batch 前检查，立即让路
-    //
-    const compactAbort = new Map<string, boolean>();  // sessionId → 是否应该中断
-    const compactRunning = new Map<string, boolean>(); // sessionId → 是否正在跑
+    // ── 提取中断机制：用户对话第一优先级 ────────────────────
+    const extractAbort = new Map<string, boolean>();
+    const extractRunning = new Map<string, boolean>();
 
-    /** 通知 compact 让路：用户有新消息了 */
-    function interruptCompact(sessionId: string): void {
-      if (compactRunning.get(sessionId)) {
-        compactAbort.set(sessionId, true);
+    function interruptExtract(sessionId: string): void {
+      if (extractRunning.get(sessionId)) {
+        extractAbort.set(sessionId, true);
       }
     }
 
-    /** 后台执行 compact，每个 batch 前检查是否被用户中断 */
-    async function runCompactBackground(sessionId: string): Promise<void> {
-      if (compactRunning.get(sessionId)) return; // 已经在跑了
-      compactRunning.set(sessionId, true);
-      compactAbort.set(sessionId, false);
-
-      try {
-        let batchNum = 0;
-        const MAX_BATCHES = 10;
-        let remaining = getUnextracted(db, sessionId, cfg.compactTurnCount * 3);
-
-        while (remaining.length >= cfg.compactTurnCount && batchNum < MAX_BATCHES) {
-          // ★ 每个 batch 前检查：用户有新消息？立即让路
-          if (compactAbort.get(sessionId)) {
-            api.logger.info(
-              `[graph-memory] compact interrupted by user message (after ${batchNum} batches)`,
-            );
-            break;
-          }
-
-          batchNum++;
-          const signals = pendingSignals(db, sessionId);
-
-          api.logger.info(
-            `[graph-memory] compact batch ${batchNum}: ${remaining.length} unextracted msgs`,
-          );
-
-          const existing = getBySession(db, sessionId).map((n) => n.name);
-          const result = await extractor.extract({
-            messages: remaining,
-            signals,
-            existingNames: existing,
-          });
-
-          // 提取完 LLM 调用后再检查一次
-          if (compactAbort.get(sessionId)) {
-            api.logger.info(
-              `[graph-memory] compact interrupted after LLM call (batch ${batchNum}, discarding result)`,
-            );
-            break;
-          }
-
-          const nameToId = new Map<string, string>();
-          for (const nc of result.nodes) {
-            const { node } = upsertNode(db, {
-              type: nc.type, name: nc.name,
-              description: nc.description, content: nc.content,
-            }, sessionId);
-            nameToId.set(node.name, node.id);
-            recaller.syncEmbed(node).catch(() => {});
-          }
-
-          for (const ec of result.edges) {
-            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
-            if (fromId && toId) {
-              upsertEdge(db, {
-                fromId, toId, type: ec.type,
-                instruction: ec.instruction, condition: ec.condition, sessionId,
-              });
-            }
-          }
-
-          const maxTurn = Math.max(...remaining.map((m: any) => m.turn_index));
-          markExtracted(db, sessionId, maxTurn);
-          markSignalsDone(db, sessionId);
-
-          api.logger.info(
-            `[graph-memory] batch ${batchNum}: ${result.nodes.length} nodes, ${result.edges.length} edges`,
-          );
-
-          remaining = getUnextracted(db, sessionId, cfg.compactTurnCount * 3);
-        }
-
-        if (batchNum > 0) {
-          invalidateGraphCache();
-        }
-      } catch (err) {
-        api.logger.error(`[graph-memory] compact failed: ${err}`);
-      } finally {
-        compactRunning.set(sessionId, false);
-        compactAbort.set(sessionId, false);
-      }
-    }
-
+    /** 存一条消息到 gm_messages（同步，零 LLM） */
     function ingestMessage(sessionId: string, message: any): void {
       const seq = (msgSeq.get(sessionId) ?? 0) + 1;
       msgSeq.set(sessionId, seq);
       saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
-      for (const s of detectSignals(message, seq)) {
-        saveSignal(db, sessionId, s);
+    }
+
+    /** 每轮结束后直接提取当前轮的消息 */
+    async function runTurnExtract(sessionId: string, newMessages: any[]): Promise<void> {
+      if (!newMessages.length) return;
+      if (extractRunning.get(sessionId)) return;
+      extractRunning.set(sessionId, true);
+      extractAbort.set(sessionId, false);
+
+      try {
+        // 获取未提取的消息（包含刚入库的）
+        const msgs = getUnextracted(db, sessionId, 50);
+        if (!msgs.length) return;
+
+        if (extractAbort.get(sessionId)) return;
+
+        const existing = getBySession(db, sessionId).map((n) => n.name);
+        const result = await extractor.extract({
+          messages: msgs,
+          existingNames: existing,
+        });
+
+        if (extractAbort.get(sessionId)) {
+          api.logger.info(`[graph-memory] extract interrupted after LLM call, discarding`);
+          return;
+        }
+
+        const nameToId = new Map<string, string>();
+        for (const nc of result.nodes) {
+          const { node } = upsertNode(db, {
+            type: nc.type, name: nc.name,
+            description: nc.description, content: nc.content,
+          }, sessionId);
+          nameToId.set(node.name, node.id);
+          recaller.syncEmbed(node).catch(() => {});
+        }
+
+        for (const ec of result.edges) {
+          const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
+          const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
+          if (fromId && toId) {
+            upsertEdge(db, {
+              fromId, toId, type: ec.type,
+              instruction: ec.instruction, condition: ec.condition, sessionId,
+            });
+          }
+        }
+
+        const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
+        markExtracted(db, sessionId, maxTurn);
+
+        if (result.nodes.length || result.edges.length) {
+          invalidateGraphCache();
+          api.logger.info(
+            `[graph-memory] extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
+          );
+        }
+      } catch (err) {
+        api.logger.error(`[graph-memory] turn extract failed: ${err}`);
+      } finally {
+        extractRunning.set(sessionId, false);
+        extractAbort.set(sessionId, false);
       }
     }
 
@@ -247,9 +214,8 @@ const graphMemoryPlugin = {
         if (!prompt) return;
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
-        // ★ 用户发了新消息 → 中断正在跑的 compact，让 API 额度给用户
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
-        if (sid) interruptCompact(sid);
+        if (sid) interruptExtract(sid);
 
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
@@ -375,8 +341,8 @@ const graphMemoryPlugin = {
         force?: boolean;
         currentTokenCount?: number;
       }) {
-        const signals = pendingSignals(db, sessionId);
-        const msgs = getUnextracted(db, sessionId, cfg.compactTurnCount * 3);
+        // compact 仍然保留作为兜底，但主要提取在 afterTurn 完成
+        const msgs = getUnextracted(db, sessionId, 50);
 
         if (!msgs.length) {
           return { ok: true, compacted: false, reason: "no messages" };
@@ -386,7 +352,6 @@ const graphMemoryPlugin = {
           const existing = getBySession(db, sessionId).map((n) => n.name);
           const result = await extractor.extract({
             messages: msgs,
-            signals,
             existingNames: existing,
           });
 
@@ -413,7 +378,6 @@ const graphMemoryPlugin = {
 
           const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
           markExtracted(db, sessionId, maxTurn);
-          markSignalsDone(db, sessionId);
 
           return {
             ok: true, compacted: true,
@@ -444,7 +408,7 @@ const graphMemoryPlugin = {
       }) {
         if (isHeartbeat) return;
 
-        // 消息入库（同步，零 LLM，不阻塞）
+        // 消息入库（同步，零 LLM）
         const newMessages = messages.slice(prePromptMessageCount ?? 0);
         for (const message of newMessages) {
           ingestMessage(sessionId, message);
@@ -455,10 +419,9 @@ const graphMemoryPlugin = {
           `[graph-memory] afterTurn sid=${sessionId.slice(0, 8)} newMsgs=${newMessages.length} totalMsgs=${totalMsgs}`,
         );
 
-        // ★ compact 放到后台异步跑，不 await，不阻塞 afterTurn 返回
-        // 用户发新消息时 before_agent_start 会调 interruptCompact() 让它停下来
-        runCompactBackground(sessionId).catch((err) => {
-          api.logger.error(`[graph-memory] background compact failed: ${err}`);
+        // ★ 每轮直接提取，不再等累积
+        runTurnExtract(sessionId, newMessages).catch((err) => {
+          api.logger.error(`[graph-memory] turn extract failed: ${err}`);
         });
       },
 
@@ -534,7 +497,6 @@ const graphMemoryPlugin = {
           for (const id of fin.invalidations) deprecate(db, id);
         }
 
-        // ██ 新增：运行图维护（PageRank + 社区检测 + 去重 + 社区描述）
         const embedFn = (recaller as any).embed ?? undefined;
         const result = await runMaintenance(db, cfg, llm, embedFn);
         api.logger.info(
@@ -605,7 +567,7 @@ const graphMemoryPlugin = {
           name: Type.String({ description: "节点名称（全小写连字符）" }),
           type: Type.String({ description: "实体类型：TASK、SKILL 或 EVENT" }),
           description: Type.String({ description: "一句话说明" }),
-          content: Type.String({ description: "Markdown 格式的知识内容" }),
+          content: Type.String({ description: "纯文本格式的知识内容" }),
           relatedSkill: Type.Optional(
             Type.String({ description: "可选：关联的已有技能名（建立 SOLVED_BY 关系）" }),
           ),
@@ -630,7 +592,7 @@ const graphMemoryPlugin = {
           }
           recaller.syncEmbed(node).catch(() => {});
           return {
-            content: [{ type: "text", text: `✅ 已记录：${node.name} (${node.type})` }],
+            content: [{ type: "text", text: `已记录：${node.name} (${node.type})` }],
             details: { name: node.name, type: node.type },
           };
         },
@@ -651,7 +613,7 @@ const graphMemoryPlugin = {
           ).all() as any[]);
 
           const text = [
-            `📊 知识图谱统计`,
+            `知识图谱统计`,
             `节点：${stats.totalNodes} 个 (${Object.entries(stats.byType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `边：${stats.totalEdges} 条 (${Object.entries(stats.byEdgeType).map(([t, c]) => `${t}: ${c}`).join(", ")})`,
             `社区：${stats.communities} 个`,
@@ -667,7 +629,6 @@ const graphMemoryPlugin = {
       { name: "gm_stats" },
     );
 
-    // gm_maintain：手动触发图维护
     api.registerTool(
       (_ctx: any) => ({
         name: "gm_maintain",
@@ -678,7 +639,7 @@ const graphMemoryPlugin = {
           const embedFn = (recaller as any).embed ?? undefined;
           const result = await runMaintenance(db, cfg, llm, embedFn);
           const text = [
-            `🔧 图维护完成（${result.durationMs}ms）`,
+            `图维护完成（${result.durationMs}ms）`,
             `去重：发现 ${result.dedup.pairs.length} 对相似节点，合并 ${result.dedup.merged} 对`,
             ...(result.dedup.pairs.length > 0
               ? result.dedup.pairs.slice(0, 5).map(p =>
