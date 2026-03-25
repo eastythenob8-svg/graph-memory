@@ -11,20 +11,38 @@
  * 可选模块：配了 embedding.apiKey 才启用，否则返回 null → 降级 FTS5
  *
  * 使用 fetch 直接调 OpenAI 兼容 /embeddings 接口（不依赖 openai SDK），
- * 兼容 OpenAI、阿里云 DashScope、MiniMax、Ollama、llama.cpp 等。
+ * 兼容 OpenAI、阿里云 DashScope、MiniMax、Jina、Ollama、llama.cpp 等。
  *
- * 支持：
- *   OpenAI       baseURL=https://api.openai.com/v1           model=text-embedding-3-small
- *   DashScope    baseURL=https://dashscope.aliyuncs.com/compatible-mode/v1  model=text-embedding-v4
- *   MiniMax      baseURL=https://api.minimax.chat/v1         model=embo-01
- *   Ollama       baseURL=http://localhost:11434/v1            model=nomic-embed-text
- *   llama.cpp    baseURL=http://127.0.0.1:8080/v1            model=your-model
- *   任意 OpenAI 兼容端点
+ * 内置：429/5xx 重试 3 次 + 10s 超时
  */
 
 import type { EmbeddingConfig } from "../types.ts";
 
 export type EmbedFn = (text: string) => Promise<number[]>;
+
+// ─── 带重试+超时的 fetch ─────────────────────────────────────
+
+const RETRYABLE = new Set([429, 500, 502, 503, 529]);
+
+async function fetchRetry(url: string, init: RequestInit, retries = 3, timeoutMs = 10_000): Promise<Response> {
+  for (let i = 0; i <= retries; i++) {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      clearTimeout(t);
+      if (res.ok || i >= retries || !RETRYABLE.has(res.status)) return res;
+      await new Promise(r => setTimeout(r, 1000 * Math.pow(2, i)));
+    } catch (err: any) {
+      clearTimeout(t);
+      if (i >= retries) throw err;
+      await new Promise(r => setTimeout(r, 1000 * (i + 1)));
+    }
+  }
+  throw new Error("[graph-memory] embed fetch failed after retries");
+}
+
+// ─── EmbedFn 工厂 ───────────────────────────────────────────
 
 export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<EmbedFn | null> {
   if (!cfg?.apiKey) return null;
@@ -33,7 +51,6 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   const model      = cfg.model ?? "text-embedding-3-small";
   const dimensions = cfg.dimensions && cfg.dimensions > 0 ? cfg.dimensions : undefined;
 
-  // ── 构建请求体的辅助函数 ──────────────────────────────────
   function buildBody(input: string): Record<string, unknown> {
     const body: Record<string, unknown> = { model, input };
     if (dimensions) body.dimensions = dimensions;
@@ -41,7 +58,7 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
   }
 
   async function callEmbedding(input: string): Promise<number[]> {
-    const res = await fetch(`${baseURL}/embeddings`, {
+    const res = await fetchRetry(`${baseURL}/embeddings`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -68,12 +85,10 @@ export async function createEmbedFn(cfg: EmbeddingConfig | undefined): Promise<E
     const probe = await callEmbedding("ping");
     if (!probe.length) return null;
 
-    // 返回实际的 embed 函数
     return async (text: string): Promise<number[]> => {
       return callEmbedding(text.slice(0, 8000));
     };
   } catch (err) {
-    // 连通性检查失败，降级到 FTS5
     if (process.env.GM_DEBUG) {
       console.error(`[graph-memory] embedding probe failed:`, err);
     }

@@ -156,15 +156,8 @@ const graphMemoryPlugin = {
     const recalled = new Map<string, { nodes: any[]; edges: any[] }>();
     const turnCounter = new Map<string, number>(); // 社区维护计数器
 
-    // ── 提取中断机制：用户对话第一优先级 ────────────────────
-    const extractAbort = new Map<string, boolean>();
-    const extractRunning = new Map<string, boolean>();
-
-    function interruptExtract(sessionId: string): void {
-      if (extractRunning.get(sessionId)) {
-        extractAbort.set(sessionId, true);
-      }
-    }
+    // ── 提取串行化（同 session Promise chain，不同 session 并行）────
+    const extractChain = new Map<string, Promise<void>>();
 
     /** 存一条消息到 gm_messages（同步，零 LLM） */
     function ingestMessage(sessionId: string, message: any): void {
@@ -174,74 +167,69 @@ const graphMemoryPlugin = {
         const row = db.prepare(
           "SELECT MAX(turn_index) as maxTurn FROM gm_messages WHERE session_id=?"
         ).get(sessionId) as any;
-        seq = Number(row?.maxTurn ?? 0);
+        seq = Number(row?.maxTurn) || 0;
       }
       seq += 1;
       msgSeq.set(sessionId, seq);
       saveMessage(db, sessionId, seq, message.role ?? "unknown", message);
     }
 
-    /** 每轮结束后直接提取当前轮的消息 */
+    /** 每轮结束后直接提取当前轮的消息（同 session 串行，不丢消息） */
     async function runTurnExtract(sessionId: string, newMessages: any[]): Promise<void> {
       if (!newMessages.length) return;
-      if (extractRunning.get(sessionId)) return;
-      extractRunning.set(sessionId, true);
-      extractAbort.set(sessionId, false);
 
-      try {
-        // 获取未提取的消息（包含刚入库的）
-        const msgs = getUnextracted(db, sessionId, 50);
-        if (!msgs.length) return;
+      // Promise chain：上一次提取完了才跑下一次，不会跳过
+      const prev = extractChain.get(sessionId) ?? Promise.resolve();
+      const next = prev.then(async () => {
+        try {
+          const msgs = getUnextracted(db, sessionId, 50);
+          if (!msgs.length) return;
 
-        if (extractAbort.get(sessionId)) return;
+          const existing = getBySession(db, sessionId).map((n) => n.name);
+          const result = await extractor.extract({
+            messages: msgs,
+            existingNames: existing,
+          });
 
-        const existing = getBySession(db, sessionId).map((n) => n.name);
-        const result = await extractor.extract({
-          messages: msgs,
-          existingNames: existing,
-        });
-
-        if (extractAbort.get(sessionId)) {
-          api.logger.info(`[graph-memory] extract interrupted after LLM call, discarding`);
-          return;
-        }
-
-        const nameToId = new Map<string, string>();
-        for (const nc of result.nodes) {
-          const { node } = upsertNode(db, {
-            type: nc.type, name: nc.name,
-            description: nc.description, content: nc.content,
-          }, sessionId);
-          nameToId.set(node.name, node.id);
-          recaller.syncEmbed(node).catch(() => {});
-        }
-
-        for (const ec of result.edges) {
-          const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
-          const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
-          if (fromId && toId) {
-            upsertEdge(db, {
-              fromId, toId, type: ec.type,
-              instruction: ec.instruction, condition: ec.condition, sessionId,
-            });
+          const nameToId = new Map<string, string>();
+          for (const nc of result.nodes) {
+            const { node } = upsertNode(db, {
+              type: nc.type, name: nc.name,
+              description: nc.description, content: nc.content,
+            }, sessionId);
+            nameToId.set(node.name, node.id);
+            recaller.syncEmbed(node).catch(() => {});
           }
-        }
 
-        const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
-        markExtracted(db, sessionId, maxTurn);
+          for (const ec of result.edges) {
+            const fromId = nameToId.get(ec.from) ?? findByName(db, ec.from)?.id;
+            const toId = nameToId.get(ec.to) ?? findByName(db, ec.to)?.id;
+            if (fromId && toId) {
+              upsertEdge(db, {
+                fromId, toId, type: ec.type,
+                instruction: ec.instruction, condition: ec.condition, sessionId,
+              });
+            }
+          }
 
-        if (result.nodes.length || result.edges.length) {
-          invalidateGraphCache();
-          api.logger.info(
-            `[graph-memory] extracted ${result.nodes.length} nodes, ${result.edges.length} edges`,
-          );
+          const maxTurn = Math.max(...msgs.map((m: any) => m.turn_index));
+          markExtracted(db, sessionId, maxTurn);
+
+          if (result.nodes.length || result.edges.length) {
+            invalidateGraphCache();
+            const nodeDetails = result.nodes.map((n: any) => `${n.type}:${n.name}`).join(", ");
+            const edgeDetails = result.edges.map((e: any) => `${e.from}→[${e.type}]→${e.to}`).join(", ");
+            api.logger.info(
+              `[graph-memory] extracted ${result.nodes.length} nodes [${nodeDetails}], ${result.edges.length} edges [${edgeDetails}]`,
+            );
+          }
+        } catch (err) {
+          api.logger.error(`[graph-memory] turn extract failed: ${err}`);
+          // 不 throw — 失败不阻塞 chain 中下一次提取
         }
-      } catch (err) {
-        api.logger.error(`[graph-memory] turn extract failed: ${err}`);
-      } finally {
-        extractRunning.set(sessionId, false);
-        extractAbort.set(sessionId, false);
-      }
+      });
+      extractChain.set(sessionId, next);
+      return next;
     }
 
     // ── before_agent_start：召回 ────────────────────────────
@@ -254,7 +242,6 @@ const graphMemoryPlugin = {
         if (prompt.includes("/new or /reset") || prompt.includes("new session was started")) return;
 
         const sid = ctx?.sessionId ?? ctx?.sessionKey;
-        if (sid) interruptExtract(sid);
 
         api.logger.info(`[graph-memory] recall query: "${prompt.slice(0, 80)}"`);
 
@@ -337,7 +324,7 @@ const graphMemoryPlugin = {
 
         if (lastTurn.dropped > 0 || episodicTokens > 0) {
           api.logger.info(
-            `[graph-memory] assemble: last turn ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
+            `[graph-memory] assemble: ${lastTurn.messages.length} msgs (~${lastTurn.tokens} tok), ` +
             `dropped ${lastTurn.dropped} older msgs, graph ~${gmTokens} tok` +
             (episodicTokens > 0 ? `, episodic ~${episodicTokens} tok` : ""),
           );
@@ -467,14 +454,20 @@ const graphMemoryPlugin = {
               `communities=${comm.count}`,
             );
 
-            // 每次社区检测后立即生成摘要（需要 LLM），确保泛化召回可用
+            // 社区摘要：fire-and-forget（后台异步，不阻塞 afterTurn 返回）
             if (comm.communities.size > 0) {
-              const { summarizeCommunities } = await import("./src/graph/community.ts");
-              const embedFn = (recaller as any).embed ?? undefined;
-              const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
-              api.logger.info(
-                `[graph-memory] community summaries refreshed: ${summaries} summaries`,
-              );
+              (async () => {
+                try {
+                  const { summarizeCommunities } = await import("./src/graph/community.ts");
+                  const embedFn = (recaller as any).embed ?? undefined;
+                  const summaries = await summarizeCommunities(db, comm.communities, llm, embedFn);
+                  api.logger.info(
+                    `[graph-memory] community summaries refreshed: ${summaries} summaries`,
+                  );
+                } catch (e) {
+                  api.logger.error(`[graph-memory] community summary failed: ${e}`);
+                }
+              })();
             }
           } catch (err) {
             api.logger.error(`[graph-memory] periodic maintenance failed: ${err}`);
@@ -500,6 +493,7 @@ const graphMemoryPlugin = {
       },
 
       async dispose() {
+        extractChain.clear();
         msgSeq.clear();
         recalled.clear();
       },
@@ -566,6 +560,7 @@ const graphMemoryPlugin = {
       } catch (err) {
         api.logger.error(`[graph-memory] session_end error: ${err}`);
       } finally {
+        extractChain.delete(sid);
         msgSeq.delete(sid);
         recalled.delete(sid);
         turnCounter.delete(sid);
@@ -727,13 +722,60 @@ const graphMemoryPlugin = {
   },
 };
 
-// ─── 取最后一轮完整用户对话 ─────────────────────────────────
+// ─── 取最近 N 轮用户交互（保留多步任务上下文） ──────────────
 
 function estimateMsgTokens(msg: any): number {
   const text = typeof msg.content === "string"
     ? msg.content
     : JSON.stringify(msg.content ?? "");
   return Math.ceil(text.length / 3);
+}
+
+const KEEP_TURNS = 5;  // 保留最近 5 轮用户交互
+
+/**
+ * 提取 assistant 消息中的纯文本内容，去掉 tool_use/thinking 等 schema
+ */
+function extractAssistantText(msg: any): string {
+  if (typeof msg.content === "string") return msg.content;
+  if (!Array.isArray(msg.content)) return "";
+  return msg.content
+    .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+    .map((b: any) => b.text)
+    .join("\n")
+    .trim();
+}
+
+/**
+ * 提取 user 消息的纯文本内容
+ * 去掉 OpenClaw 包装的 metadata（Sender JSON block、命令前缀、时间戳等）
+ */
+function extractUserText(msg: any): string {
+  let raw: string;
+  if (typeof msg.content === "string") {
+    raw = msg.content;
+  } else if (!Array.isArray(msg.content)) {
+    raw = String(msg.content ?? "");
+  } else {
+    raw = msg.content
+      .filter((b: any) => b && typeof b === "object" && b.type === "text" && typeof b.text === "string")
+      .map((b: any) => b.text)
+      .join("\n")
+      .trim();
+  }
+
+  // 去掉 OpenClaw metadata: "Sender (untrusted metadata):\n```json\n{...}\n```\n实际内容"
+  // 策略：找最后一个 ``` 闭合后的内容，如果没有 ``` 就用 cleanPrompt 兜底
+  const fenceEnd = raw.lastIndexOf("```");
+  if (fenceEnd >= 0 && raw.includes("Sender")) {
+    raw = raw.slice(fenceEnd + 3).trim();
+  }
+
+  // 兜底：去掉命令前缀、时间戳标记等
+  raw = raw.replace(/^\/\w+\s+/, "").trim();
+  raw = raw.replace(/^\[[\w\s\-:]+\]\s*/, "").trim();
+
+  return raw;
 }
 
 function sliceLastTurn(
@@ -743,18 +785,29 @@ function sliceLastTurn(
     return { messages: [], tokens: 0, dropped: 0 };
   }
 
-  let lastUserIdx = -1;
+  // ── 找到最近 N 个 user 消息的位置 ────────────────────
+  const userIndices: number[] = [];
   for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].role === "user") { lastUserIdx = i; break; }
+    if (messages[i].role === "user") {
+      userIndices.push(i);
+      if (userIndices.length >= KEEP_TURNS) break;
+    }
   }
-  if (lastUserIdx < 0) lastUserIdx = 0;
+  if (!userIndices.length) {
+    return { messages: [], tokens: 0, dropped: messages.length };
+  }
 
-  let kept = messages.slice(lastUserIdx);
-  const dropped = lastUserIdx;
+  // userIndices 是倒序的：[最新user, ..., 最早user]
+  // 最后一轮的 user 位置
+  const lastTurnUserIdx = userIndices[0];
 
-  // 截断超长 tool_result（只截断 string 类型，数组结构不动，避免破坏 content.filter）
+  // ── 最后 1 轮：完整保留（含 toolResult，Agent 需要最新执行结果）──
+  let lastTurnMsgs = messages.slice(lastTurnUserIdx);
+  const lastTurnTotal = lastTurnMsgs.length;
+
+  // 截断超长 tool_result
   const TOOL_MAX = 6000;
-  kept = kept.map((msg: any) => {
+  lastTurnMsgs = lastTurnMsgs.map((msg: any) => {
     if (msg.role !== "tool" && msg.role !== "toolResult") return msg;
     if (typeof msg.content !== "string") return msg;
     if (msg.content.length <= TOOL_MAX) return msg;
@@ -763,8 +816,41 @@ function sliceLastTurn(
     return { ...msg, content: msg.content.slice(0, head) + `\n...[truncated ${msg.content.length - head - tail} chars]...\n` + msg.content.slice(-tail) };
   });
 
+  // ── 前 N-1 轮：只保留 user 输入 + assistant 文本（去掉 tool schema）──
+  const prevTurnMsgs: any[] = [];
+  let prevOriginalCount = 0;
+
+  if (userIndices.length > 1) {
+    // 从最早的 user 到最后一轮 user 之前
+    const earliestIdx = userIndices[userIndices.length - 1];
+    prevOriginalCount = lastTurnUserIdx - earliestIdx;
+
+    for (let i = earliestIdx; i < lastTurnUserIdx; i++) {
+      const msg = messages[i];
+      if (!msg) continue;
+
+      if (msg.role === "user") {
+        const text = extractUserText(msg);
+        if (text) {
+          prevTurnMsgs.push({ role: "user", content: text });
+        }
+      } else if (msg.role === "assistant") {
+        const text = extractAssistantText(msg);
+        if (text) {
+          prevTurnMsgs.push({ role: "assistant", content: text });
+        }
+      }
+      // toolResult / tool_use / thinking 等全部跳过
+    }
+  }
+
+  // ── 合并：前 N-1 轮摘要 + 最后 1 轮完整 ────────────────
+  const kept = [...prevTurnMsgs, ...lastTurnMsgs];
+  const dropped = messages.length - kept.length;
+
   let tokens = 0;
   for (const msg of kept) tokens += estimateMsgTokens(msg);
+
   return { messages: kept, tokens, dropped };
 }
 
